@@ -6,6 +6,8 @@ const redis = connect()
 let debug = Debug('punt:worker')
 const logger = console
 
+const UNIQUE_ID_KEY = '__punt__:__unique_ids__'
+
 //eslint-disable-next-line @typescript-eslint/no-explicit-any
 type CallbackFn = (message: any) => void
 interface HandlerMap {
@@ -55,6 +57,11 @@ const deadletter = async (message: Message): Promise<void> => {
     'message',
     JSON.stringify(message)
   )
+
+  // Clean up unique ID tracking so the job can be re-enqueued if needed
+  if (message.uniqueId) {
+    await redis.hdel(UNIQUE_ID_KEY, message.uniqueId)
+  }
 }
 
 interface ErrorHandlerSettings {
@@ -192,6 +199,12 @@ export const listenForMessages = async (
     debug(
       `The ${message.job} job with id=${messageId} received on topic ${topicName} was successfully processed.`
     )
+
+    // Clean up unique ID tracking if this job had one
+    if (message.uniqueId) {
+      await redis.hdel(UNIQUE_ID_KEY, message.uniqueId)
+      debug(`Removed unique ID '${message.uniqueId}' from tracking.`)
+    }
   } catch (error) {
     if (error instanceof Error) {
       errorHandler(messageId, message, error, {

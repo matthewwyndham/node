@@ -6,6 +6,17 @@ export interface Message {
   retryCount: number
   lastAttemptedAt: number | null
   lastError: string | null
+  uniqueId?: string
+}
+
+export interface PuntOptions {
+  uniqueId?: string
+}
+
+export interface PuntResult {
+  messageId: string
+  status: 'enqueued' | 'duplicate'
+  warning?: string
 }
 
 export interface WorkerOpts {
