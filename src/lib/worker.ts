@@ -7,6 +7,10 @@ let debug = Debug('punt:worker')
 const logger = console
 
 const UNIQUE_ID_KEY = '__punt__:__unique_ids__'
+const DEFAULT_STREAM_KEY = '__punt__:__default__'
+const PRIORITY_STREAM_KEY = '__punt__:__priority__'
+const RETRY_SET_KEY = '__punt__:__retryset__'
+const DEADLETTER_STREAM_KEY = '__punt__:__deadletter__'
 
 //eslint-disable-next-line @typescript-eslint/no-explicit-any
 type CallbackFn = (message: any) => void
@@ -50,7 +54,7 @@ const exponentialBackoff = (
 
 const deadletter = async (message: Message): Promise<void> => {
   await redis.xadd(
-    '__punt__:__deadletter__',
+    DEADLETTER_STREAM_KEY,
     '*',
     'job',
     message.job,
@@ -112,7 +116,7 @@ export const errorHandler = async (
 
   // Push message to retry set
   await redis.zadd(
-    '__punt__:__retryset__',
+    RETRY_SET_KEY,
     nextExecution.toString(),
     JSON.stringify(updatedMessage)
   )
@@ -176,7 +180,7 @@ export const listenForMessages = async (
   // Check priority stream first (non-blocking)
   debug(`Checking priority stream for messages.`)
   response = await tryReadFromStream(
-    '__punt__:__priority__',
+    PRIORITY_STREAM_KEY,
     group,
     workerId,
     args.recovery,
@@ -184,18 +188,18 @@ export const listenForMessages = async (
   )
 
   if (response && response[0] && response[0][1].length > 0) {
-    streamKey = '__punt__:__priority__'
+    streamKey = PRIORITY_STREAM_KEY
   } else {
     // Fall back to default stream (blocking)
     debug(`No priority messages, checking default stream.`)
     response = await tryReadFromStream(
-      '__punt__:__default__',
+      DEFAULT_STREAM_KEY,
       group,
       workerId,
       args.recovery,
       timeout
     )
-    streamKey = '__punt__:__default__'
+    streamKey = DEFAULT_STREAM_KEY
   }
 
   if (response == null) {
@@ -270,13 +274,13 @@ export const retryMonitor = async (opts: RetryMonitorArgs = {}) => {
   const retryConnection = redis.duplicate()
 
   // Watch the retry set for changes
-  await retryConnection.watch('__punt__:__retryset__')
+  await retryConnection.watch(RETRY_SET_KEY)
 
   debug(`[Retry Monitor] Checking for messages to retry at ${currentTime}.`)
 
   // Check if any messages with a score lower than the current time exist in the retry set
   const [jsonEncodedMessage] = await retryConnection.zrangebyscore(
-    '__punt__:__retryset__',
+    RETRY_SET_KEY,
     '-inf',
     currentTime,
     'LIMIT',
@@ -294,14 +298,14 @@ export const retryMonitor = async (opts: RetryMonitorArgs = {}) => {
     debug(`[Retry Monitor] Retrying job ${jsonEncodedMessage}`)
 
     // Route to correct stream based on priority
-    const stream = message.priority ? '__punt__:__priority__' : '__punt__:__default__'
+    const stream = message.priority ? PRIORITY_STREAM_KEY : DEFAULT_STREAM_KEY
 
     // Adds message back to its queue for reprocessing and removes it from
     // the retry set
     await retryConnection
       .multi()
       .xadd(stream, '*', 'job', message.job, 'message', jsonEncodedMessage)
-      .zrem('__punt__:__retryset__', jsonEncodedMessage)
+      .zrem(RETRY_SET_KEY, jsonEncodedMessage)
       .exec()
   }
 
@@ -326,8 +330,8 @@ const createConsumerGroup = async (streamKey: string, group: string) => {
 
 export const startUp = async () => {
   // Create consumer groups for both streams
-  await createConsumerGroup('__punt__:__default__', 'workers')
-  await createConsumerGroup('__punt__:__priority__', 'workers')
+  await createConsumerGroup(DEFAULT_STREAM_KEY, 'workers')
+  await createConsumerGroup(PRIORITY_STREAM_KEY, 'workers')
 
   // Reprocess messages from the group's history of pending messages
   let lastMessageId: string | null = '0-0'

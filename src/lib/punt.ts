@@ -5,6 +5,8 @@ import connect from '../redis'
 let redis: Redis
 
 const UNIQUE_ID_KEY = '__punt__:__unique_ids__'
+const DEFAULT_STREAM_KEY = '__punt__:__default__'
+const PRIORITY_STREAM_KEY = '__punt__:__priority__'
 
 const punt = async (
   job: string,
@@ -35,7 +37,7 @@ const punt = async (
     priority,
   }
 
-  const stream = priority ? '__punt__:__priority__' : '__punt__:__default__'
+  const stream = priority ? PRIORITY_STREAM_KEY : DEFAULT_STREAM_KEY
   const messageId = await redis.xadd(
     stream,
     '*',
