@@ -5,13 +5,15 @@ import connect from '../redis'
 let redis: Redis
 
 const UNIQUE_ID_KEY = '__punt__:__unique_ids__'
+const DEFAULT_STREAM_KEY = '__punt__:__default__'
+const PRIORITY_STREAM_KEY = '__punt__:__priority__'
 
 const punt = async (
   job: string,
   data: unknown = {},
   options?: PuntOptions
 ): Promise<PuntResult> => {
-  const { uniqueId } = options || {}
+  const { uniqueId, priority } = options || {}
 
   // Check if a job with this unique ID already exists
   if (uniqueId) {
@@ -32,10 +34,12 @@ const punt = async (
     lastAttemptedAt: null,
     lastError: null,
     uniqueId,
+    priority,
   }
 
+  const stream = priority ? PRIORITY_STREAM_KEY : DEFAULT_STREAM_KEY
   const messageId = await redis.xadd(
-    '__punt__:__default__',
+    stream,
     '*',
     'job',
     job,

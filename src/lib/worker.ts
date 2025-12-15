@@ -7,6 +7,10 @@ let debug = Debug('punt:worker')
 const logger = console
 
 const UNIQUE_ID_KEY = '__punt__:__unique_ids__'
+const DEFAULT_STREAM_KEY = '__punt__:__default__'
+const PRIORITY_STREAM_KEY = '__punt__:__priority__'
+const RETRY_SET_KEY = '__punt__:__retryset__'
+const DEADLETTER_STREAM_KEY = '__punt__:__deadletter__'
 
 //eslint-disable-next-line @typescript-eslint/no-explicit-any
 type CallbackFn = (message: any) => void
@@ -50,7 +54,7 @@ const exponentialBackoff = (
 
 const deadletter = async (message: Message): Promise<void> => {
   await redis.xadd(
-    '__punt__:__deadletter__',
+    DEADLETTER_STREAM_KEY,
     '*',
     'job',
     message.job,
@@ -112,7 +116,7 @@ export const errorHandler = async (
 
   // Push message to retry set
   await redis.zadd(
-    '__punt__:__retryset__',
+    RETRY_SET_KEY,
     nextExecution.toString(),
     JSON.stringify(updatedMessage)
   )
@@ -122,46 +126,80 @@ interface listenArgs {
   recovery: boolean
 }
 
-export const listenForMessages = async (
-  args: listenArgs,
-  opts: WorkerOpts = {}
-): Promise<string | null> => {
-  const timeout = opts.timeout ?? 5_000
-  const topic = opts.topic ?? '__default__'
-  const group = opts.group ?? 'workers'
-  const workerId = opts.worker ?? 'worker'
-  const ts = opts.ts ?? Date.now()
-
-  let message: Message | null = null
-
-  debug(`Listening for messages on the ${topic} topic.`)
-
-  let response
-
-  if (args.recovery) {
-    response = await redis.xreadgroup(
+/**
+ * Try to read a message from a specific stream.
+ * Returns the response or null if no messages available.
+ */
+const tryReadFromStream = async (
+  stream: string,
+  group: string,
+  workerId: string,
+  recovery: boolean,
+  blockMs: number
+) => {
+  if (recovery) {
+    return redis.xreadgroup(
       'GROUP',
       group,
       workerId,
       'COUNT',
       1,
       'STREAMS',
-      `__punt__:${topic}`,
+      stream,
       '0-0'
     )
   } else {
-    response = await redis.xreadgroup(
+    return redis.xreadgroup(
       'GROUP',
       group,
       workerId,
       'COUNT',
       '1',
       'BLOCK',
-      timeout,
+      blockMs,
       'STREAMS',
-      `__punt__:${topic}`,
+      stream,
       '>'
     )
+  }
+}
+
+export const listenForMessages = async (
+  args: listenArgs,
+  opts: WorkerOpts = {}
+): Promise<string | null> => {
+  const timeout = opts.timeout ?? 5_000
+  const group = opts.group ?? 'workers'
+  const workerId = opts.worker ?? 'worker'
+  const ts = opts.ts ?? Date.now()
+
+  let message: Message | null = null
+  let response
+  let streamKey: string
+
+  // Check priority stream first (non-blocking)
+  debug(`Checking priority stream for messages.`)
+  response = await tryReadFromStream(
+    PRIORITY_STREAM_KEY,
+    group,
+    workerId,
+    args.recovery,
+    0 // Non-blocking for priority
+  )
+
+  if (response && response[0] && response[0][1].length > 0) {
+    streamKey = PRIORITY_STREAM_KEY
+  } else {
+    // Fall back to default stream (blocking)
+    debug(`No priority messages, checking default stream.`)
+    response = await tryReadFromStream(
+      DEFAULT_STREAM_KEY,
+      group,
+      workerId,
+      args.recovery,
+      timeout
+    )
+    streamKey = DEFAULT_STREAM_KEY
   }
 
   if (response == null) {
@@ -219,7 +257,7 @@ export const listenForMessages = async (
   debug(
     `Ack-ing ${message.job} job with ID=${messageId} received on topic ${topicName}.`
   )
-  await redis.xack(`__punt__:${topic}`, group, messageId)
+  await redis.xack(streamKey, group, messageId)
 
   // Returns the id of the successfully processed message
   return messageId
@@ -236,13 +274,13 @@ export const retryMonitor = async (opts: RetryMonitorArgs = {}) => {
   const retryConnection = redis.duplicate()
 
   // Watch the retry set for changes
-  await retryConnection.watch('__punt__:__retryset__')
+  await retryConnection.watch(RETRY_SET_KEY)
 
   debug(`[Retry Monitor] Checking for messages to retry at ${currentTime}.`)
 
   // Check if any messages with a score lower than the current time exist in the retry set
   const [jsonEncodedMessage] = await retryConnection.zrangebyscore(
-    '__punt__:__retryset__',
+    RETRY_SET_KEY,
     '-inf',
     currentTime,
     'LIMIT',
@@ -255,38 +293,28 @@ export const retryMonitor = async (opts: RetryMonitorArgs = {}) => {
     debug(`[Retry Monitor] No messages found for retrying.`)
     await retryConnection.unwatch()
   } else {
-    const message = JSON.parse(jsonEncodedMessage)
+    const message: Message = JSON.parse(jsonEncodedMessage)
 
     debug(`[Retry Monitor] Retrying job ${jsonEncodedMessage}`)
+
+    // Route to correct stream based on priority
+    const stream = message.priority ? PRIORITY_STREAM_KEY : DEFAULT_STREAM_KEY
 
     // Adds message back to its queue for reprocessing and removes it from
     // the retry set
     await retryConnection
       .multi()
-      .xadd(
-        '__punt__:__default__',
-        '*',
-        'job',
-        message.job,
-        'message',
-        jsonEncodedMessage
-      )
-      .zrem('__punt__:__retryset__', jsonEncodedMessage)
+      .xadd(stream, '*', 'job', message.job, 'message', jsonEncodedMessage)
+      .zrem(RETRY_SET_KEY, jsonEncodedMessage)
       .exec()
   }
 
   retryConnection.disconnect()
 }
 
-export const startUp = async () => {
+const createConsumerGroup = async (streamKey: string, group: string) => {
   try {
-    await redis.xgroup(
-      'CREATE',
-      '__punt__:__default__',
-      'workers',
-      '$',
-      'MKSTREAM'
-    )
+    await redis.xgroup('CREATE', streamKey, group, '$', 'MKSTREAM')
   } catch (error) {
     if (error instanceof Error) {
       if (!error.message.includes('BUSYGROUP')) {
@@ -298,6 +326,12 @@ export const startUp = async () => {
       throw error
     }
   }
+}
+
+export const startUp = async () => {
+  // Create consumer groups for both streams
+  await createConsumerGroup(DEFAULT_STREAM_KEY, 'workers')
+  await createConsumerGroup(PRIORITY_STREAM_KEY, 'workers')
 
   // Reprocess messages from the group's history of pending messages
   let lastMessageId: string | null = '0-0'
