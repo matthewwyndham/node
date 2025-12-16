@@ -127,17 +127,16 @@ export const listenForMessages = async (
   opts: WorkerOpts = {}
 ): Promise<string | null> => {
   const timeout = opts.timeout ?? 5_000
-  const topic = opts.topic ?? '__default__'
+  let topic = opts.topic ?? '__default__'
   const group = opts.group ?? 'workers'
   const workerId = opts.worker ?? 'worker'
   const ts = opts.ts ?? Date.now()
 
   let message: Message | null = null
-
-  debug(`Listening for messages on the ${topic} topic.`)
-
   let response
 
+  // Check priority stream first (non-blocking)
+  debug(`Checking priority stream for messages.`)
   if (args.recovery) {
     response = await redis.xreadgroup(
       'GROUP',
@@ -146,7 +145,7 @@ export const listenForMessages = async (
       'COUNT',
       1,
       'STREAMS',
-      `__punt__:${topic}`,
+      '__punt__:__priority__',
       '0-0'
     )
   } else {
@@ -157,11 +156,44 @@ export const listenForMessages = async (
       'COUNT',
       '1',
       'BLOCK',
-      timeout,
+      0, // Non-blocking for priority
       'STREAMS',
-      `__punt__:${topic}`,
+      '__punt__:__priority__',
       '>'
     )
+  }
+
+  // If we got a priority message, use it
+  if (response && response[0] && response[0][1].length > 0) {
+    topic = '__priority__'
+  } else {
+    // Fall back to default stream (blocking)
+    debug(`No priority messages, checking ${topic} stream.`)
+    if (args.recovery) {
+      response = await redis.xreadgroup(
+        'GROUP',
+        group,
+        workerId,
+        'COUNT',
+        1,
+        'STREAMS',
+        `__punt__:${topic}`,
+        '0-0'
+      )
+    } else {
+      response = await redis.xreadgroup(
+        'GROUP',
+        group,
+        workerId,
+        'COUNT',
+        '1',
+        'BLOCK',
+        timeout,
+        'STREAMS',
+        `__punt__:${topic}`,
+        '>'
+      )
+    }
   }
 
   if (response == null) {
@@ -255,22 +287,20 @@ export const retryMonitor = async (opts: RetryMonitorArgs = {}) => {
     debug(`[Retry Monitor] No messages found for retrying.`)
     await retryConnection.unwatch()
   } else {
-    const message = JSON.parse(jsonEncodedMessage)
+    const message: Message = JSON.parse(jsonEncodedMessage)
 
     debug(`[Retry Monitor] Retrying job ${jsonEncodedMessage}`)
+
+    // Route to correct stream based on priority
+    const stream = message.priority
+      ? '__punt__:__priority__'
+      : '__punt__:__default__'
 
     // Adds message back to its queue for reprocessing and removes it from
     // the retry set
     await retryConnection
       .multi()
-      .xadd(
-        '__punt__:__default__',
-        '*',
-        'job',
-        message.job,
-        'message',
-        jsonEncodedMessage
-      )
+      .xadd(stream, '*', 'job', message.job, 'message', jsonEncodedMessage)
       .zrem('__punt__:__retryset__', jsonEncodedMessage)
       .exec()
   }
@@ -278,15 +308,9 @@ export const retryMonitor = async (opts: RetryMonitorArgs = {}) => {
   retryConnection.disconnect()
 }
 
-export const startUp = async () => {
+const createConsumerGroup = async (stream: string, group: string) => {
   try {
-    await redis.xgroup(
-      'CREATE',
-      '__punt__:__default__',
-      'workers',
-      '$',
-      'MKSTREAM'
-    )
+    await redis.xgroup('CREATE', stream, group, '$', 'MKSTREAM')
   } catch (error) {
     if (error instanceof Error) {
       if (!error.message.includes('BUSYGROUP')) {
@@ -298,6 +322,12 @@ export const startUp = async () => {
       throw error
     }
   }
+}
+
+export const startUp = async () => {
+  // Create consumer groups for both default and priority streams
+  await createConsumerGroup('__punt__:__default__', 'workers')
+  await createConsumerGroup('__punt__:__priority__', 'workers')
 
   // Reprocess messages from the group's history of pending messages
   let lastMessageId: string | null = '0-0'

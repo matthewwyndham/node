@@ -7,10 +7,12 @@ export interface Message {
   lastAttemptedAt: number | null
   lastError: string | null
   uniqueId?: string
+  priority?: boolean
 }
 
 export interface PuntOptions {
   uniqueId?: string
+  priority?: boolean
 }
 
 export interface PuntResult {

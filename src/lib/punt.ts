@@ -11,7 +11,7 @@ const punt = async (
   data: unknown = {},
   options?: PuntOptions
 ): Promise<PuntResult> => {
-  const { uniqueId } = options || {}
+  const { uniqueId, priority } = options || {}
 
   // Check if a job with this unique ID already exists
   if (uniqueId) {
@@ -32,10 +32,11 @@ const punt = async (
     lastAttemptedAt: null,
     lastError: null,
     uniqueId,
+    priority,
   }
 
   const messageId = await redis.xadd(
-    '__punt__:__default__',
+    priority ? '__punt__:__priority__' : '__punt__:__default__',
     '*',
     'job',
     job,
